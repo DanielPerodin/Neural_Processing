@@ -7,6 +7,7 @@ You will need to download Neo (NeuralEnsemble) from the GitHub link execute the 
 pip install git+https://github.com/NeuralEnsemble/python-neo.git
 
 ***Note: pip installing Neo directly will not work because PyPI hasn’t updated the version to work with our type of .ncs files yet***
+
 You can pip install the remaining required libraries.
 
 How To Use:
