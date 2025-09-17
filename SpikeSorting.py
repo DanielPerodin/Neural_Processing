@@ -463,7 +463,7 @@ def create_enhanced_qc_interface(templates, quality_metrics, channel_spike_data,
 # -------------------------
 
 # 1. Load Neuralynx Data
-data_folder = r"C:\Users\perod\WaveletMatching\mouse46\2014-05-22_13-11-55"
+data_folder = r"C:\path\to\folder"
 
 reader = NeuralynxIO(dirname=data_folder)
 blk = reader.read_block(lazy=False)
@@ -524,4 +524,5 @@ if rejected_channels:
     else:
         print("\nUsing initial results with all channels.")
 else:
+
     print("\nNO CHANNELS REJECTED - Initial analysis is complete!")
