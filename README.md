@@ -3,7 +3,9 @@ Program to perform spike sorting for Neuralynx (.ncs) files, handling single ses
 
 Set Up:
 You will need to download Neo (NeuralEnsemble) from the GitHub link execute the following in your terminal:
+
 pip install git+https://github.com/NeuralEnsemble/python-neo.git
+
 ***Note: pip installing Neo directly will not work because PyPI hasn’t updated the version to work with our type of .ncs files yet***
 You can pip install the remaining required libraries.
 
