@@ -13,11 +13,11 @@ You can pip install the remaining required libraries.
 
 How To Use:
 
-There are 2 scripts: clustering6.py handles single recordings (what we’re calling “days”) with multiple channels, and compare_templates.py correlates the spike templates that clustering6.py creates for each cluster on all channels for each recording session (day).
+There are 2 scripts: clustering7.py handles single recordings (what we’re calling “days”) with multiple channels, and compare_templates.py correlates the spike templates that clustering7.py creates for each cluster on all channels for each recording session (day).
 
-clustering6.py:
+clustering7.py:
 
-In quotes, write the directory of the folder containing the .ncs files for a recording session into line 673 where it says “data_folder = ”. Run the program. It will begin by asking if you would like to reject any channels from processing. It will then ask if you want to make groups for CAR. It will then begin performing common average referencing (CAR) in the specified groups or across all channels depending on your choices. It will create a folder named “clustering_results” and save outputs there.
+In quotes, write the directory of the folder containing the .ncs files for a recording session into line 664 where it says “data_folder = ”. Run the program. It will begin by asking if you would like to reject any channels from processing. It will then ask if you want to make groups for CAR. It will then begin performing common average referencing (CAR) in the specified groups or across all channels depending on your choices. It will create a folder named “clustering_results” and save outputs there.
 
 
 Compare_templates.py:
