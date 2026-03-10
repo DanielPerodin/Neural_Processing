@@ -25,8 +25,10 @@ print(files)
 
 data_amp = {}        
 data_clusters = {}  
+data_snr = {}
+data_nf = {}
 
-all_channels = set()
+all_channels = list(range(1, 17))
 num_days = len(files)
 
 for day_index, file in enumerate(files):
@@ -38,7 +40,6 @@ for day_index, file in enumerate(files):
 
     for ch_id, ch_data in data["channels"].items():
         ch_id = int(ch_id)
-        all_channels.add(ch_id)
 
         n_clusters = ch_data["n_clusters"]
 
@@ -47,13 +48,29 @@ for day_index, file in enumerate(files):
 
         data_clusters[ch_id][day] = n_clusters
 
-        for cluster in ch_data["cluster_metrics"]:
-            amp = cluster["median_peak_to_trough_amplitude"]
+        amp = []
+        snr = []
+        nf = []
 
+        for cluster in ch_data["cluster_metrics"]:
+            amp.append(cluster["median_peak_to_trough_amplitude"])
+            snr.append(cluster["snr"])
+            nf.append(cluster["channel_noise_floor_rms_uV"])
+
+        if len(amp) > 0:
             if ch_id not in data_amp:
                 data_amp[ch_id] = {}
 
-            data_amp[ch_id][day] = amp
+            if ch_id not in data_snr:
+                data_snr[ch_id] = {}
+            
+            if ch_id not in data_nf:
+                data_nf[ch_id] = {}
+
+
+            data_amp[ch_id][day] = np.mean(amp)
+            data_snr[ch_id][day] = np.mean(snr)
+            data_nf[ch_id][day] = np.mean(nf)
 
 # bulid matrices
 
@@ -62,6 +79,8 @@ all_days = list(range(1, num_days + 1))
 
 amp_matrix = np.full((len(all_channels), num_days), np.nan)
 cluster_matrix = np.full((len(all_channels), num_days), np.nan)
+snr_matrix = np.full((len(all_channels), num_days), np.nan)
+nf_matrix = np.full((len(all_channels), num_days), np.nan)
 
 for i, ch in enumerate(all_channels):
     for j, day in enumerate(all_days):
@@ -71,6 +90,12 @@ for i, ch in enumerate(all_channels):
 
         if ch in data_clusters and day in data_clusters[ch]:
             cluster_matrix[i, j] = data_clusters[ch][day]
+
+        if ch in data_snr and day in data_snr[ch]:
+            snr_matrix[i, j] = data_snr[ch][day]
+            
+        if ch in data_nf and day in data_nf[ch]:
+            nf_matrix[i, j] = data_nf[ch][day]
 
 amplitude_df = pd.DataFrame(
     amp_matrix,
@@ -84,11 +109,29 @@ clusters_df = pd.DataFrame(
     columns=all_days
 )
 
+snr_df = pd.DataFrame(
+    snr_matrix,
+    index=[f"Channel {ch}" for ch in all_channels],
+    columns=all_days
+)
+
+nf_df = pd.DataFrame(
+    nf_matrix,
+    index=[f"Channel {ch}" for ch in all_channels],
+    columns=all_days
+)
+
 print("Amplitude Data:")
 print(amplitude_df)
 
 print("\nCluster Count Data:")
 print(clusters_df)
+
+print("\nSNR Data:")
+print(snr_df)
+
+print("\nNF Data:")
+print(nf_df)
 
 # plot amplitude heatmap
 
@@ -103,7 +146,7 @@ plt.yticks(range(len(all_channels)), amplitude_df.index)
 
 plt.xlabel("Days Elapsed")
 plt.ylabel("Channel")
-plt.title("Peak-to-Trough Amplitude Across Days")
+plt.title("Peak-to-Trough Amplitude (μV) Across Days")
 
 plt.tight_layout()
 plt.show()
@@ -123,12 +166,49 @@ plt.xlabel("Days Elapsed")
 plt.ylabel("Channel")
 plt.title("Cluster Count Across Days")
 
+plt.tight_layout()
+plt.show()
+
+# plot snr heat map
+
+snr_df = snr_df.fillna(0)
+
+plt.figure(figsize=(12, 6))
+plt.imshow(snr_df, aspect="auto", cmap="autumn_r", vmin = 0)
+plt.colorbar(label="SNR")
+
+plt.xticks(range(num_days), [i * 7 for i in range(num_days)])
+plt.yticks(range(len(all_channels)), snr_df.index)
+
+plt.xlabel("Days Elapsed")
+plt.ylabel("Channel")
+plt.title("SNR Across Days")
+
+plt.tight_layout()
+plt.show()
+
+# plot nf heat map
+
+nf_df = nf_df.fillna(0)
+
+plt.figure(figsize=(12, 6))
+plt.imshow(nf_df, aspect="auto", cmap="autumn_r", vmin = 0)
+plt.colorbar(label="Noise Floor")
+
+plt.xticks(range(num_days), [i * 7 for i in range(num_days)])
+plt.yticks(range(len(all_channels)), nf_df.index)
+
+plt.xlabel("Days Elapsed")
+plt.ylabel("Channel")
+plt.title("Noise Floor Across Days")
+
+plt.tight_layout()
+plt.show()
+
+
 # add numbers inside cells
 for i in range(len(all_channels)):
     for j in range(num_days):
         value = clusters_df.iloc[i, j]
         if not np.isnan(value):
             plt.text(j, i, int(value), ha='center', va='center', color='black')
-
-plt.tight_layout()
-plt.show()
