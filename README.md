@@ -13,14 +13,16 @@ You can pip install the remaining required libraries.
 
 How To Use:
 
-There are 2 scripts: clustering7.py handles single recordings (what we’re calling “days”) with multiple channels, and compare_templates.py correlates the spike templates that clustering7.py creates for each cluster on all channels for each recording session (day).
+There are 2 scripts: clustering7.py handles single recordings (what we’re calling “days”) with multiple channels, and template_compare2.py correlates the spike templates that clustering7.py creates for each cluster on all channels for each recording session (day).
 
 clustering7.py:
 
 In quotes, write the directory of the folder containing the .ncs files for a recording session into line 664 where it says “data_folder = ”. Run the program. It will begin by asking if you would like to reject any channels from processing. It will then ask if you want to make groups for CAR. It will then begin performing common average referencing (CAR) in the specified groups or across all channels depending on your choices. It will create a folder named “clustering_results” and save outputs there.
 
 
-Compare_templates.py:
+template_compare2.py:
 
-At the bottom of the code, under “compare_templates_across_sessions([”, write the directories of the template files you want to compare (there are commented examples, make sure to end the file name with .npy). Run the program. It will create a folder called “template_comparison” and will save images which show superimposed spike templates as well as correlations between templates of the same channel across multiple sessions.
+Organize data like this before running: Every template file in a given folder must come from the same channel, and must have some indication of the date on which the data was recorded (for example the file name could be "channel_9_cluster_templatesDay57" or "channel_9_cluster_templates7-24").
+
+At the bottom of the code, under “folders_to_process = [”, write the directories of folders which contain the template files you want to compare (there are commented examples, make sure to end the file name with .npy). Run the program. It will create a folder called “template_comparison” and will save images which show superimposed spike templates as well as correlations and covariances between templates of the same channel across multiple sessions.
 
