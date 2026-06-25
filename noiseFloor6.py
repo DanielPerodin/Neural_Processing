@@ -10,6 +10,7 @@ from tridesclous.signalpreprocessor import (
 )
 import tridesclous as tdc
 import tempfile
+import shutil
 
 # ==========================================
 # CONFIGURATION
@@ -168,16 +169,35 @@ def load_middle_snippet(folder, snippet_duration_s):
     return raw_uV, fs
 
 
-def get_preprocessor_params(fs, n_channels):
+def load_full_recording(folder):
     """
-    Get the standard Tridesclous preprocessor params for the given
-    recording without creating any processed data on disk.
-    We only need the 'preprocessor' sub-dict.
+    Load the entire recording into memory for spike detection.
+    Returns raw_uV (n_samples, n_channels) float32 and fs.
     """
-    import shutil
+    reader = NeuralynxIO(dirname=folder)
+    blk = reader.read_block(lazy=False)
+    signal = blk.segments[0].analogsignals[0]
+    fs = float(signal.sampling_rate.rescale('Hz'))
+    raw_uV = np.array(signal.rescale('uV')).astype('float32')
+    return raw_uV, fs
+
+
+# ==========================================
+# METRIC CALCULATION
+# ==========================================
+
+
+# ==========================================
+# TRIDESCLOUS HELPERS
+# ==========================================
+
+def get_preprocessor_params(fs, n_channels=1):
+    """
+    Fetch Tridesclous auto preprocessor params for the given sampling rate.
+    Creates a throw-away DataIO with a dummy file, reads the params, deletes everything.
+    """
     temp_folder = tempfile.mkdtemp(prefix="tdc_params_")
     try:
-        # write a tiny dummy file just to satisfy DataIO
         dummy = np.zeros((int(fs), n_channels), dtype='float32')
         dummy_file = os.path.join(temp_folder, 'dummy.raw')
         dummy.tofile(dummy_file)
@@ -190,130 +210,153 @@ def get_preprocessor_params(fs, n_channels):
             sample_rate=fs,
             total_channel=n_channels
         )
-        dataio.add_one_channel_group(
-            channels=list(range(n_channels)), chan_grp=0
-        )
+        dataio.add_one_channel_group(channels=list(range(n_channels)), chan_grp=0)
         params = tdc.get_auto_params_for_catalogue(dataio, chan_grp=0)
         return params['preprocessor']
+    except Exception as e:
+        print(f"Warning: could not fetch TDC params, using defaults. ({e})")
+        return {'highpass_freq': 300., 'lowpass_freq': 5000.,
+                'smooth_size': 0, 'common_ref_removal': False}
     finally:
         try:
             shutil.rmtree(temp_folder)
-        except:
+        except Exception:
             pass
 
 
-# ==========================================
-# METRIC CALCULATION
-# ==========================================
-
-def calculate_metrics(ch_data_snippet, fs, preprocessor_params):
+def calculate_channel_noise_metrics(channel_data, fs, preprocessor_params):
     """
-    Compute noise and SNR metrics for a single channel snippet.
+    Compute MAD and RMS noise floor for a single-channel snippet.
+    Signal and SNR are left as 0.0 — they are filled in after spike detection
+    by compute_snr_from_waveforms(), so SNR is always grounded in actual
+    Tridesclous-detected spikes rather than a threshold heuristic.
 
-    Pipeline
-    --------
-    Uses two Tridesclous internal functions directly on the numpy array —
-    no DataIO, no temp folders, no CatalogueConstructor:
-
-      offline_signal_preprocessor(..., normalize=False)
-          Applies the same bandpass filter (300-5000 Hz, 5th-order Butterworth,
-          filtfilt) that Tridesclous uses internally, but returns values in
-          the original µV units rather than normalizing.
-
-      estimate_medians_mads_after_preprocesing(...)
-          Filters with normalize=False and returns (median, MAD) per channel,
-          which is Tridesclous's own noise estimate.
-
-    Metrics
-    -------
-    MAD (µV)
-        Tridesclous's native noise unit. median(|x - median(x)|) of the
-        filtered signal, computed by Tridesclous's own median_mad function.
-
-    Threshold
-        -3 × MAD (downward deflections).
-        Per Tridesclous docs: 3 MAD = 99.7% of Gaussian noise.
-
-    Noise samples  : filtered_sig >= threshold  (baseline, 99.7%)
-    Spike samples  : filtered_sig <  threshold  (putative spikes)
-
-    RMS noise (µV)  [PI's metric]
-        RMS of noise samples only — baseline power after spike exclusion.
-
-    RMS signal (µV)
-        RMS of spike samples only.
-
-    SNR
-        RMS signal / RMS noise.
-
-    Args
-    ----
-    ch_data_snippet   : np.ndarray, shape (n_samples, 1), float32, µV
-    fs                : float, Hz
-    preprocessor_params : dict from tdc.get_auto_params_for_catalogue
-
-    Returns
-    -------
-    dict with keys:
-        mad_uV, rms_noise_uV, rms_signal_uV, snr, spike_sample_count
+    Returns dict: {mad_uV, rms_noise_uV, mean_peak_signal_uV=0, channel_snr=0}
     """
     results = {
-        'mad_uV':             np.nan,
-        'rms_noise_uV':       np.nan,
-        'rms_signal_uV':      np.nan,
-        'snr':                np.nan,
-        'spike_sample_count': 0,
+        'mad_uV':              0.0,
+        'rms_noise_uV':        1.0,
+        'mean_peak_signal_uV': 0.0,
+        'channel_snr':         0.0,
     }
-
     try:
-        # --- Filter only, keep µV units ---
+        data_2d = channel_data[:, None] if channel_data.ndim == 1 else channel_data
+
         filtered = offline_signal_preprocessor(
-            ch_data_snippet,
-            fs,
-            normalize=False,
-            **preprocessor_params
+            data_2d, fs, normalize=False, **preprocessor_params
         )
         flat = filtered[:, 0]
 
-        # --- MAD: Tridesclous's own noise estimate ---
-        # estimate_medians_mads_after_preprocesing filters then calls
-        # median_mad(), which computes median(|x - median(x)|) per channel
-        med, mad = estimate_medians_mads_after_preprocesing(
-            ch_data_snippet,
-            fs,
-            **preprocessor_params
+        _, mad = estimate_medians_mads_after_preprocesing(
+            data_2d, fs, **preprocessor_params
         )
         mad_uv = float(mad[0])
         results['mad_uV'] = mad_uv
 
-        # --- Split into noise and spike samples at 3×MAD ---
-        threshold = -3.0 * mad_uv
-        noise_samples = flat[flat >= threshold]
-        spike_samples = flat[flat <  threshold]
-        results['spike_sample_count'] = int(spike_samples.shape[0])
-
-        # --- RMS noise: PI's metric ---
+        noise_samples = flat[flat >= -3.0 * mad_uv]
         if noise_samples.shape[0] > 0:
-            results['rms_noise_uV'] = float(
-                np.sqrt(np.mean(noise_samples ** 2))
-            )
-
-        # --- RMS signal and SNR ---
-        if spike_samples.shape[0] > 0:
-            rms_signal = float(np.sqrt(np.mean(spike_samples ** 2)))
-            results['rms_signal_uV'] = rms_signal
-            if results['rms_noise_uV'] > 0:
-                results['snr'] = rms_signal / results['rms_noise_uV']
-        else:
-            results['rms_signal_uV'] = 0.0
-            results['snr'] = 0.0
-
+            results['rms_noise_uV'] = float(np.sqrt(np.mean(noise_samples ** 2)))
     except Exception as e:
-        print(f"\n  [metric error] {e}")
+        print(f"  [noise metric error] {e}")
         traceback.print_exc()
-
     return results
 
+
+def compute_snr_from_waveforms(waveforms, channel_metrics):
+    """
+    Fill mean_peak_signal_uV and channel_snr into channel_metrics (in-place)
+    using the trough of each detected spike waveform as the signal measure.
+        signal = |mean( min(waveform) for each spike )|
+        SNR    = signal / rms_noise_uV
+    Returns 0 for both if no waveforms are provided.
+    """
+    if waveforms is None or len(waveforms) == 0:
+        channel_metrics['mean_peak_signal_uV'] = 0.0
+        channel_metrics['channel_snr']         = 0.0
+        return channel_metrics
+    peaks     = np.array([np.min(wf) for wf in waveforms])
+    mean_peak = float(abs(np.mean(peaks)))
+    rms_noise = channel_metrics.get('rms_noise_uV', 1.0)
+    channel_metrics['mean_peak_signal_uV'] = mean_peak
+    channel_metrics['channel_snr'] = mean_peak / rms_noise if rms_noise > 0 else 0.0
+    return channel_metrics
+
+
+def detect_spikes_and_waveforms(channel_data, sampling_rate):
+    """
+    Run the Tridesclous detection + peeling pipeline on a single channel and
+    return extracted waveforms — no plotting, no JSON, no cluster output.
+    Used to compute SNR from actual detected spikes.
+
+    Returns dict:
+        waveforms   – np.ndarray (n_spikes, n_template_samples), or empty
+        spike_times – np.ndarray (n_spikes,), seconds
+        n_spikes    – int
+        status      – 'ok' | 'no_spikes' | 'error'
+    """
+    empty = {'waveforms': np.empty((0,), dtype='float32'),
+             'spike_times': np.empty((0,), dtype='float64'),
+             'n_spikes': 0, 'status': 'no_spikes'}
+
+    if channel_data.ndim == 1:
+        channel_data = channel_data[:, None]
+    channel_data = channel_data.astype('float32')
+
+    temp_folder = tempfile.mkdtemp(prefix="tdc_detect_")
+    try:
+        raw_file = os.path.join(temp_folder, 'raw.raw')
+        channel_data.tofile(raw_file)
+
+        dataio = tdc.DataIO(dirname=temp_folder)
+        dataio.set_data_source(type='RawData', filenames=[raw_file],
+                               dtype='float32', sample_rate=sampling_rate,
+                               total_channel=1)
+        dataio.add_one_channel_group(channels=[0])
+
+        cc = tdc.CatalogueConstructor(dataio=dataio, chan_grp=0)
+        params = tdc.get_auto_params_for_catalogue(dataio, chan_grp=0)
+        cc.apply_all_steps(params, verbose=False)
+        cc.make_catalogue_for_peeler()
+
+        catalogue = dataio.load_catalogue(chan_grp=0)
+        peeler = tdc.Peeler(dataio)
+        peeler.change_params(catalogue=catalogue)
+        peeler.run(progressbar=False)
+
+        spikes = dataio.get_spikes(seg_num=0, chan_grp=0).copy()
+        if len(spikes) == 0:
+            return empty
+
+        n_template_samples = catalogue['centers0'].shape[1]
+        pre_samples  = n_template_samples // 2
+        post_samples = n_template_samples - pre_samples
+        n_total      = len(channel_data)
+
+        waveforms, spike_times = [], []
+        for spike in spikes:
+            idx   = spike['index']
+            label = spike['cluster_label']
+            s, e  = idx - pre_samples, idx + post_samples
+            if s >= 0 and e <= n_total and label >= 0:
+                waveforms.append(channel_data[s:e, 0])
+                spike_times.append(idx / sampling_rate)
+
+        if not waveforms:
+            return empty
+
+        return {'waveforms':   np.array(waveforms,   dtype='float32'),
+                'spike_times': np.array(spike_times, dtype='float64'),
+                'n_spikes':    len(waveforms),
+                'status':      'ok'}
+    except Exception as e:
+        print(f"  [spike detection error] {e}")
+        traceback.print_exc()
+        return {**empty, 'status': 'error'}
+    finally:
+        try:
+            shutil.rmtree(temp_folder)
+        except Exception:
+            pass
 
 # ==========================================
 # MAIN
@@ -322,12 +365,10 @@ def calculate_metrics(ch_data_snippet, fs, preprocessor_params):
 def main():
     print("=" * 60)
     print("NOISE & SNR CALCULATOR")
-    print(f"Snippet : {SNIPPET_DURATION_S}s from middle of recording")
-    print("Filter  : Tridesclous offline_signal_preprocessor (normalize=False)")
-    print("MAD     : Tridesclous estimate_medians_mads_after_preprocesing")
-    print("Noise   : RMS of samples within 3×MAD (baseline only)")
-    print("Signal  : RMS of samples beyond 3×MAD (spikes only)")
-    print("SNR     : RMS signal / RMS noise")
+    print(f"Noise   : {SNIPPET_DURATION_S}s middle snippet → MAD + RMS noise floor")
+    print("Spikes  : full recording → Tridesclous detection + peeling")
+    print("Signal  : |mean of per-spike trough amplitudes| across full recording")
+    print("SNR     : |mean spike trough| / RMS noise  (0 if no spikes detected)")
     print("=" * 60)
 
     # 1. Path input
@@ -364,22 +405,17 @@ def main():
         traceback.print_exc()
         return
 
-    # 3. Get Tridesclous preprocessor params once (shared across all folders/channels)
+    # 3. Get Tridesclous preprocessor params once (used for noise metric filtering)
     print("\nFetching Tridesclous preprocessor params...")
     preprocessor_params = get_preprocessor_params(fs_global, n_channels)
     print(f"  {preprocessor_params}")
-
-    # 4. User configuration (done once, applied to all folders)
-    excluded_channels = get_excluded_channels(n_channels)
-    car_groups        = get_car_groups(n_channels, excluded_channels)
-    included_channels = [ch for ch in range(n_channels) if ch not in excluded_channels]
 
     print(f"\nStarting analysis ({SNIPPET_DURATION_S}s middle snippet per recording)...")
     print("-" * 60)
 
     all_rows = []
 
-    # 5. Main processing loop
+    # 4. Main processing loop
     for folder in subfolders:
         folder_name = os.path.basename(folder)
 
@@ -388,33 +424,54 @@ def main():
 
         print(f"\nProcessing: {folder_name}")
 
+        # 5. Per-folder CAR configuration
+        excluded_channels = get_excluded_channels(n_channels)
+        car_groups        = get_car_groups(n_channels, excluded_channels)
+        included_channels = [ch for ch in range(n_channels) if ch not in excluded_channels]
+
         try:
-            # A. Load middle snippet only
-            print(f"  > Loading {SNIPPET_DURATION_S}s from middle...", end="\r")
+            # A. Load 60s snippet for noise metrics
+            print(f"  > Loading {SNIPPET_DURATION_S}s snippet (noise metrics)...", end="\r")
             raw_snippet, fs = load_middle_snippet(folder, SNIPPET_DURATION_S)
             n_loaded_s = raw_snippet.shape[0] / fs
-            print(f"  > Loaded {n_loaded_s:.1f}s  "
+            print(f"  > Snippet: {n_loaded_s:.1f}s  "
                   f"({raw_snippet.shape[0]} samples @ {fs:.0f} Hz)")
 
-            # B. Apply CAR across all included channels
+            # B. Load full recording for spike detection
+            print(f"  > Loading full recording (spike detection)...", end="\r")
+            raw_full, _ = load_full_recording(folder)
+            print(f"  > Full recording: {raw_full.shape[0] / fs:.1f}s  "
+                  f"({raw_full.shape[0]} samples)")
+
+            # C. Apply CAR to both
             car_snippet = apply_car_to_data(raw_snippet, car_groups)
+            car_full    = apply_car_to_data(raw_full,    car_groups)
 
             row = {'Date_Folder': folder_name}
 
-            # C. Per-channel metrics
+            # D. Per-channel metrics
             for ch in included_channels:
                 print(f"  > Analyzing Channel {ch}...          ", end="\r")
 
-                # shape (n_samples, 1) — offline_signal_preprocessor expects 2D
-                ch_data = car_snippet[:, ch:ch+1]
-                m = calculate_metrics(ch_data, fs, preprocessor_params)
+                ch_snippet = car_snippet[:, ch:ch+1]  # 60s — noise metrics only
+                ch_full    = car_full[:,    ch:ch+1]  # full recording — spike detection
+
+                # Noise metrics (MAD + RMS noise floor) from 60s snippet
+                noise_m = calculate_channel_noise_metrics(
+                    ch_snippet, fs, preprocessor_params
+                )
+
+                # Spike detection from full recording → SNR grounded in all spikes
+                spike_result = detect_spikes_and_waveforms(ch_full, fs)
+                compute_snr_from_waveforms(spike_result['waveforms'], noise_m)
 
                 p = f"Ch{ch}"
-                row[f'{p}_MAD_uV']        = round(m['mad_uV'],        3)
-                row[f'{p}_RMS_Noise_uV']  = round(m['rms_noise_uV'],  3)
-                row[f'{p}_RMS_Signal_uV'] = round(m['rms_signal_uV'], 3)
-                row[f'{p}_SNR']           = round(m['snr'],           3)
-                row[f'{p}_SpikeSamples']  = m['spike_sample_count']
+                row[f'{p}_MAD_uV']       = round(noise_m['mad_uV'],               3)
+                row[f'{p}_RMS_Noise_uV'] = round(noise_m['rms_noise_uV'],         3)
+                row[f'{p}_MeanPeak_uV']  = round(noise_m['mean_peak_signal_uV'],  3)
+                row[f'{p}_SNR']          = round(noise_m['channel_snr'],          3)
+                row[f'{p}_N_Spikes']     = spike_result['n_spikes']
+                row[f'{p}_DetectStatus'] = spike_result['status']
 
             print(f"  > Done.                                    ")
             all_rows.append(row)
