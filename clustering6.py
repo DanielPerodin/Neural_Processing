@@ -670,7 +670,7 @@ def process_all_channels(raw_data, sampling_rate, excluded_channels, output_dir=
 # -------------------------
 
 # Load Neuralynx Data
-data_folder = r"C:\path\to\the\data"
+data_folder = r"data"
 
 reader = NeuralynxIO(dirname=data_folder)
 blk = reader.read_block(lazy=False)

@@ -176,7 +176,7 @@ def compare_templates_across_sessions(template_files, output_dir='template_compa
 
 compare_templates_across_sessions([
    # Place template files as shown below:
-   #  r'C:\path\to\session_x.npy',
-   #  r'C:\path\to\session_y.npy',
-   #  r'C:\path\to\session_z.npy',
+     r'C:\path\to\session_x.npy',
+     r'C:\path\to\session_y.npy',
+     r'C:\path\to\session_z.npy',
 ], output_dir='template_comparison')
