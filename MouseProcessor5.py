@@ -5,6 +5,8 @@ import tempfile
 import shutil
 
 import numpy as np
+if not hasattr(np, "in1d"):
+    np.in1d = np.isin
 import pandas as pd
 import matplotlib.pyplot as plt
 
@@ -21,6 +23,13 @@ from tridesclous.signalpreprocessor import (
     estimate_medians_mads_after_preprocesing,
 )
 
+TDC_TEMP_ROOT = r"E:\FDA Raw Data\ephys\tdc_temp"
+
+os.makedirs(
+    TDC_TEMP_ROOT,
+    exist_ok=True
+)
+
 # ==========================================
 # TRIDESCLOUS HELPERS
 # ==========================================
@@ -29,7 +38,10 @@ def get_preprocessor_params(fs, n_channels=1):
     """
     Fetch Tridesclous auto preprocessor params for the given sampling rate.
     """
-    temp_folder = tempfile.mkdtemp(prefix="tdc_params_")
+    temp_folder = tempfile.mkdtemp(
+        prefix="tdc_params_",
+        dir=TDC_TEMP_ROOT
+    )
     try:
         dummy = np.zeros((int(fs), n_channels), dtype='float32')
         dummy_file = os.path.join(temp_folder, 'dummy.raw')
@@ -50,82 +62,161 @@ def get_preprocessor_params(fs, n_channels=1):
         print(f"Warning: could not fetch TDC params, using defaults. ({e})")
         return {'highpass_freq': 300., 'lowpass_freq': 5000.,
                 'smooth_size': 0, 'common_ref_removal': False}
+
     finally:
+
+        dataio = None
+
+        gc.collect()
+
         try:
-            shutil.rmtree(temp_folder)
-        except Exception:
-            pass
+            shutil.rmtree(
+                temp_folder
+            )
+
+        except Exception as cleanup_error:
+
+            print(
+                f"Warning: could not remove "
+                f"temporary parameter folder: "
+                f"{cleanup_error}"
+            )
 
 
-def calculate_channel_noise_metrics(channel_data, fs, preprocessor_params):
+def calculate_noise_metrics_excluding_spikes(
+    channel_data,
+    spike_indices,
+    fs,
+    preprocessor_params,
+    snippet_duration_s=60.0,
+    exclude_start_s=60.0,
+    spike_mask_before_ms=1.0,
+    spike_mask_after_ms=2.0,
+):
     """
-    Compute MAD and RMS noise floor for a single-channel snippet.
-    Signal and SNR are left as 0.0 — filled in after spike detection
-    by compute_snr_from_waveforms().
+    Calculate MAD and RMS noise from a fixed snippet while excluding
+    samples surrounding detected spikes.
 
-    Returns dict: {mad_uV, rms_noise_uV, mean_peak_signal_uV=0, channel_snr=0}
+    The snippet begins after exclude_start_s. Detected spike windows
+    are masked before calculating the RMS noise floor.
     """
+
     results = {
-        'mad_uV':              0.0,
-        'rms_noise_uV':        1.0,
+        'mad_uV': 0.0,
+        'rms_noise_uV': 1.0,
         'mean_peak_signal_uV': 0.0,
-        'channel_snr':         0.0,
+        'channel_snr': 0.0,
     }
+
     try:
-        data_2d = channel_data[:, None] if channel_data.ndim == 1 else channel_data
+        total_samples = channel_data.shape[0]
+
+        snippet_samples = int(snippet_duration_s * fs)
+        start = int(exclude_start_s * fs)
+        stop = min(start + snippet_samples, total_samples)
+
+        if stop <= start:
+            print("  Recording is too short for requested noise snippet.")
+            return results
+
+        snippet = channel_data[start:stop]
+
+        data_2d = (
+            snippet[:, None]
+            if snippet.ndim == 1
+            else snippet
+        )
 
         filtered = offline_signal_preprocessor(
-            data_2d, fs, normalize=False, **preprocessor_params
+            data_2d,
+            fs,
+            normalize=False,
+            **preprocessor_params
         )
+
         flat = filtered[:, 0]
 
         _, mad = estimate_medians_mads_after_preprocesing(
-            data_2d, fs, **preprocessor_params
+            data_2d,
+            fs,
+            **preprocessor_params
         )
+
         mad_uv = float(mad[0])
         results['mad_uV'] = mad_uv
 
-        noise_samples = flat[(flat >= -3.0 * mad_uv) & (flat <= 3.0 * mad_uv)]
+        noise_mask = np.ones(flat.shape[0], dtype=bool)
+
+        before_samples = int(
+            spike_mask_before_ms / 1000.0 * fs
+        )
+
+        after_samples = int(
+            spike_mask_after_ms / 1000.0 * fs
+        )
+
+        spike_indices = np.asarray(
+            spike_indices,
+            dtype=np.int64
+        )
+
+        spikes_in_snippet = spike_indices[
+            (spike_indices >= start)
+            & (spike_indices < stop)
+        ]
+
+        relative_spikes = spikes_in_snippet - start
+
+        for spike_index in relative_spikes:
+            mask_start = max(
+                0,
+                spike_index - before_samples
+            )
+
+            mask_stop = min(
+                flat.shape[0],
+                spike_index + after_samples + 1
+            )
+
+            noise_mask[mask_start:mask_stop] = False
+
+        noise_samples = flat[noise_mask]
+
+        # Additional robust amplitude mask
+        noise_samples = noise_samples[
+            (noise_samples >= -3.0 * mad_uv)
+            & (noise_samples <= 3.0 * mad_uv)
+        ]
+
         if noise_samples.shape[0] > 0:
-            results['rms_noise_uV'] = float(np.sqrt(np.mean(noise_samples ** 2)))
+            results['rms_noise_uV'] = float(
+                np.sqrt(
+                    np.mean(noise_samples ** 2)
+                )
+            )
+
+        print(
+            f"  Noise snippet: "
+            f"{start / fs:.2f}s -> {stop / fs:.2f}s"
+        )
+
+        print(
+            f"  Spikes masked in snippet: "
+            f"{len(relative_spikes)}"
+        )
+
+        print(
+            f"  Noise samples retained: "
+            f"{noise_samples.shape[0]:,}"
+        )
+
     except Exception as e:
         print(f"  [noise metric error] {e}")
+
         import traceback
         traceback.print_exc()
+
     return results
-
-
-def find_spike_free_snippet(total_samples, spike_indices, sampling_rate,
-                             snippet_duration_s=60.0, exclude_start_s=60.0, step_s=1.0):
-    """
-    Search for a `snippet_duration_s`-second window containing NO detected spikes,
-    disallowing any window that overlaps the first `exclude_start_s` seconds of
-    the recording.
-
-    Returns (start_sample, end_sample) for the first spike-free window found,
-    or None if no such window exists anywhere in the recording.
-    """
-    snippet_len = int(snippet_duration_s * sampling_rate)
-    exclude_samples = int(exclude_start_s * sampling_rate)
-    step = max(1, int(step_s * sampling_rate))
-
-    latest_start = total_samples - snippet_len
-    if latest_start < exclude_samples:
-        # Recording isn't even long enough to contain a valid candidate window
-        return None
-
-    spike_indices_sorted = np.sort(np.asarray(spike_indices))
-
-    start = exclude_samples
-    while start <= latest_start:
-        end = start + snippet_len
-        lo = np.searchsorted(spike_indices_sorted, start, side='left')
-        hi = np.searchsorted(spike_indices_sorted, end, side='left')
-        if hi == lo:
-            return start, end
-        start += step
-
-    return None
 
 
 def compute_snr_from_waveforms(waveforms, channel_metrics):
@@ -271,11 +362,23 @@ def cluster_channel_with_tridesclous(channel_id, raw_data, sampling_rate, output
     print(f"Processing Channel {channel_id}")
     print(f"{'='*60}")
     
-    temp_folder = tempfile.mkdtemp(prefix=f"tdc_channel_{channel_id}_")
+    temp_folder = tempfile.mkdtemp(
+        prefix=f"tdc_channel_{channel_id}_",
+        dir=TDC_TEMP_ROOT
+    )
 
     try:
         # Extract single channel data
-        channel_data = raw_data[:, channel_id:channel_id+1].astype('float32')
+        channel_data = raw_data[
+            :,
+            channel_id:channel_id+1
+        ]
+
+        if channel_data.dtype != np.float32:
+            channel_data = channel_data.astype(
+                np.float32,
+                copy=False
+            )
         total_samples = channel_data.shape[0]
 
         # -----------------------------------------------------------
@@ -291,9 +394,44 @@ def cluster_channel_with_tridesclous(channel_id, raw_data, sampling_rate, output
                                dtype='float32', sample_rate=sampling_rate, total_channel=1)
         dataio.add_one_channel_group(channels=[0])
 
-        cc = tdc.CatalogueConstructor(dataio=dataio, chan_grp=0)
-        params = tdc.get_auto_params_for_catalogue(dataio, chan_grp=0)
-        cc.apply_all_steps(params, verbose=True)
+        cc = tdc.CatalogueConstructor(
+            dataio=dataio,
+            chan_grp=0
+        )
+
+        params = tdc.get_auto_params_for_catalogue(
+            dataio,
+            chan_grp=0
+        )
+
+        try:
+            cc.apply_all_steps(
+                params,
+                verbose=True
+            )
+
+        except ValueError as e:
+            if "need at least one array to concatenate" in str(e):
+                print(
+                    f"⚠️  Tridesclous found no usable waveform "
+                    f"selection for channel {channel_id}."
+                )
+
+                print(
+                    f"Skipping channel {channel_id}: "
+                    "no waveforms available for clustering."
+                )
+
+                return {
+                    "channel_id": channel_id,
+                    "status": "NO_USABLE_WAVEFORMS",
+                    "n_clusters": 0,
+                    "cluster_metrics": [],
+                    "channel_metrics": None
+                }
+
+            raise
+
         cc.make_catalogue_for_peeler()
 
         catalogue = dataio.load_catalogue(chan_grp=0)
@@ -304,36 +442,45 @@ def cluster_channel_with_tridesclous(channel_id, raw_data, sampling_rate, output
 
         # -----------------------------------------------------------
         # STEP 2: Calculate Channel Noise Metrics (RMS SNR Method)
-        # using a 60s window that contains NO detected spikes and
-        # does not overlap the first 60s of the recording.
+        # using a fixed 60s snippet after the first 60s.
+        # Detected spike windows are masked before estimating noise.
         # -----------------------------------------------------------
         print("Calculating channel noise metrics (RMS method)...")
 
         all_spike_indices = spikes['index']
-        snippet_bounds = find_spike_free_snippet(
-            total_samples, all_spike_indices, sampling_rate,
-            snippet_duration_s=60.0, exclude_start_s=60.0
+
+        preprocessor_params = get_preprocessor_params(
+            sampling_rate,
+            n_channels=1
         )
 
-        if snippet_bounds is None:
-            print(f"  ⚠️  No spike-free 60s window found for channel {channel_id} "
-                  f"(outside the first 60s of the recording). Noise floor metrics "
-                  f"will use default placeholder values (mad_uV=0.0, rms_noise_uV=1.0).")
-            channel_metrics = {
-                'mad_uV': 0.0,
-                'rms_noise_uV': 1.0,
-                'mean_peak_signal_uV': 0.0,
-                'channel_snr': 0.0,
-            }
-        else:
-            snippet_start, snippet_end = snippet_bounds
-            metric_data = channel_data[snippet_start:snippet_end]
-            tdc_params = get_preprocessor_params(sampling_rate)
-            channel_metrics = calculate_channel_noise_metrics(metric_data, sampling_rate, tdc_params)
+        noise_metrics = calculate_noise_metrics_excluding_spikes(
+            channel_data,
+            all_spike_indices,
+            sampling_rate,
+            preprocessor_params,
+            snippet_duration_s=60.0,
+            exclude_start_s=60.0,
+            spike_mask_before_ms=1.0,
+            spike_mask_after_ms=2.0,
+        )
 
-        print(f"  Channel MAD: {channel_metrics['mad_uV']:.2f} µV")
-        print(f"  Noise Floor (RMS): {channel_metrics['rms_noise_uV']:.2f} µV")
-        print(f"  Channel SNR: (pending spike extraction)")
+        channel_metrics = noise_metrics
+
+        print(
+            f"  Channel MAD: "
+            f"{channel_metrics['mad_uV']:.2f} µV"
+        )
+
+        print(
+            f"  Noise Floor (RMS): "
+            f"{channel_metrics['rms_noise_uV']:.2f} µV"
+        )
+
+        print(
+            "  Channel SNR: "
+            "(pending spike extraction)"
+        )
         # -----------------------------------------------------------
 
         # Get unique clusters (excluding noise cluster -1)
@@ -350,120 +497,12 @@ def cluster_channel_with_tridesclous(channel_id, raw_data, sampling_rate, output
             # Check for detected spikes
             all_spike_indices = spikes['index']
             
-            if len(all_spike_indices) == 0:
-                print(f"No spikes detected at all for channel {channel_id}")
-                return None
-            
-            print(f"Found {len(all_spike_indices)} detected spikes (unclustered)")
-            
-            # Extract waveforms
-            all_waveforms = []
-            all_spike_times = []
-            
-            for spike in spikes:
-                peak_idx = spike['index']
-                start, end = peak_idx - pre_samples, peak_idx + post_samples
-                
-                if start >= 0 and end <= len(channel_data):
-                    waveform = channel_data[start:end, 0]
-                    spike_time = peak_idx / sampling_rate
-                    all_waveforms.append(waveform)
-                    all_spike_times.append(spike_time)
-            
-            if len(all_waveforms) == 0:
-                return None
-            
-            all_waveforms = np.array(all_waveforms)
-            mean_template = np.mean(all_waveforms, axis=0)
-
-            # Compute SNR from detected waveform peaks
-            compute_snr_from_waveforms(all_waveforms, channel_metrics)
-            
-            # Save "no cluster" template
-            templates_file = os.path.join(output_dir, f'channel_{channel_id}_NO_CLUSTERS_detected_spikes_template.npy')
-            np.save(templates_file, {'no_cluster_template': mean_template})
-            
-            # Metrics (Passing Channel Metrics)
-            metrics = calculate_cluster_quality_metrics(all_waveforms, all_spike_times, sampling_rate, -1, channel_metrics)
-            metrics['cluster_label'] = 'NO_CLUSTERS'
-            
-            metrics_file = os.path.join(output_dir, f'channel_{channel_id}_NO_CLUSTERS_metrics.json')
-            with open(metrics_file, 'w') as f:
-                json.dump(metrics, f, indent=2)
-            
-            # Visualization
-            t_axis = np.linspace(-pre_samples / sampling_rate * 1000,
-                                  post_samples / sampling_rate * 1000,
-                                  n_template_samples)
-
-            fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-            fig.suptitle(f"Channel {channel_id} — NO CLUSTERS FOUND ({len(all_waveforms)} spikes detected)",
-                         fontsize=16, fontweight='bold', color='orange')
-
-            # Panel 1: Waveforms
-            ax = axes[0, 0]
-            n_to_plot = min(200, len(all_waveforms))
-            indices_to_plot = np.random.choice(len(all_waveforms), n_to_plot, replace=False)
-            for i in indices_to_plot:
-                ax.plot(t_axis, all_waveforms[i], color='lightgray', linewidth=0.5, alpha=0.3)
-            ax.plot(t_axis, mean_template, color='red', linewidth=3, label='NO_CLUSTERS mean')
-            ax.set_xlabel("Time (ms)")
-            ax.set_ylabel("Amplitude (µV)")
-            ax.set_title("Spike Waveforms (NO_CLUSTERS)")
-            ax.legend(loc='best')
-            ax.grid(True, alpha=0.3)
-
-            # Panel 2: Spike time histogram
-            ax = axes[0, 1]
-            ax.hist(all_spike_times, bins=min(50, len(all_spike_times)//5 + 1), alpha=0.7, color='gray')
-            ax.set_xlabel("Time (s)")
-            ax.set_ylabel("Spike Count")
-            ax.set_title("Spike Time Distribution (NO_CLUSTERS)")
-            ax.grid(True, alpha=0.3)
-
-            # Panel 3: PCA 2D
-            ax = axes[1, 0]
-            if len(all_waveforms) >= 3:
-                try:
-                    pca = PCA(n_components=min(2, len(all_waveforms)))
-                    pca_2d = pca.fit_transform(all_waveforms)
-                    ax.scatter(pca_2d[:, 0], pca_2d[:, 1], color='gray', s=10, alpha=0.5,
-                               label='NO_CLUSTERS')
-                    ax.set_xlabel("PC1")
-                    ax.set_ylabel("PC2")
-                    ax.legend(loc='best')
-                except Exception:
-                    ax.text(0.5, 0.5, "PCA failed", ha='center')
-            ax.set_title("PCA 2D (NO_CLUSTERS)")
-            ax.grid(True, alpha=0.3, linestyle='--')
-
-            # Panel 4: Full metrics summary
-            ax = axes[1, 1]
-            ax.axis('off')
-            metrics_text  = f"Channel {channel_id} — NO CLUSTERS\n"
-            metrics_text += "=" * 36 + "\n"
-            metrics_text += f"MAD:                {metrics['channel_mad_uV']:.3f} µV\n"
-            metrics_text += f"Noise Floor (RMS):  {metrics['channel_noise_floor_rms_uV']:.3f} µV\n"
-            metrics_text += f"Signal (Mean Peak): {metrics['mean_peak_signal_uV']:.3f} µV\n"
-            metrics_text += f"Channel SNR:        {metrics['channel_snr']:.3f}\n"
-            metrics_text += "-" * 36 + "\n"
-            metrics_text += f"Total Spikes:       {len(all_waveforms)}\n"
-
-            ax.text(0.05, 0.97, metrics_text, transform=ax.transAxes, verticalalignment='top',
-                    fontsize=9, fontfamily='monospace',
-                    bbox=dict(boxstyle="round,pad=0.5", facecolor="wheat", alpha=0.9))
-
-            plt.tight_layout()
-            plt.savefig(os.path.join(output_dir, f"channel_{channel_id}_NO_CLUSTERS.png"), dpi=300)
-            plt.close()
-            
             return {
-                'channel_id': channel_id,
-                'n_clusters': 0,
-                'n_spikes_detected': len(all_waveforms),
-                'cluster_metrics': [metrics],
-                'status': 'NO_CLUSTERS_DETECTED',
-                'channel_metrics': channel_metrics
+                "channel_id": channel_id,
+                "status": "NO_SPIKES_DETECTED",
+                "n_clusters": 0,
+                "cluster_metrics": [],
+                "channel_metrics": channel_metrics,
             }
         
         print(f"Found {n_clusters} clusters on channel {channel_id}")
@@ -522,8 +561,45 @@ def cluster_channel_with_tridesclous(channel_id, raw_data, sampling_rate, output
         all_labels = np.array(all_labels)
         
         print("Performing PCA on waveforms...")
-        pca = PCA(n_components=3)
-        principal_components = pca.fit_transform(all_waveforms)
+
+        max_pca_waveforms = 5000
+
+        if len(all_waveforms) > max_pca_waveforms:
+
+            rng = np.random.default_rng(42)
+
+            pca_indices = rng.choice(
+                len(all_waveforms),
+                size=max_pca_waveforms,
+                replace=False
+            )
+
+            pca_waveforms = all_waveforms[
+                pca_indices
+            ]
+
+            pca_labels = all_labels[
+                pca_indices
+            ]
+
+            print(
+                f"Using {max_pca_waveforms:,} of "
+                f"{len(all_waveforms):,} waveforms "
+                f"for PCA visualization."
+            )
+
+        else:
+
+            pca_waveforms = all_waveforms
+            pca_labels = all_labels
+
+        pca = PCA(
+            n_components=3
+        )
+
+        principal_components = pca.fit_transform(
+            pca_waveforms
+        )
         
         colors = plt.cm.tab10(np.linspace(0, 1, len(unique_labels)))
         color_map = {label: colors[i] for i, label in enumerate(unique_labels)}
@@ -556,33 +632,94 @@ def cluster_channel_with_tridesclous(channel_id, raw_data, sampling_rate, output
         plt.close()
         
         # PLOT 2: PCA 2D
-        fig, ax = plt.subplots(figsize=(10, 8))
+        fig, ax = plt.subplots(
+            figsize=(10, 8)
+        )
+
         for label in unique_labels:
-            mask = (all_labels == label)
-            ax.scatter(principal_components[mask, 0], principal_components[mask, 1],
-                      color=color_map[label], s=15, alpha=0.7, label=f"Cluster {label}")
+
+            mask = (
+                pca_labels == label
+            )
+
+            ax.scatter(
+                principal_components[mask, 0],
+                principal_components[mask, 1],
+                color=color_map[label],
+                s=15,
+                alpha=0.7,
+                label=f"Cluster {label}"
+            )
+
         ax.set_xlabel("PC1")
         ax.set_ylabel("PC2")
-        ax.set_title(f"Channel {channel_id} — PCA 2D")
+
+        ax.set_title(
+            f"Channel {channel_id} — PCA 2D"
+        )
+
         ax.legend(loc='best')
-        ax.grid(True, alpha=0.3, linestyle='--')
-        plt.savefig(os.path.join(output_dir, f"channel_{channel_id}_pca_2d.png"), dpi=300)
+
+        ax.grid(
+            True,
+            alpha=0.3,
+            linestyle='--'
+        )
+
+        plt.savefig(
+            os.path.join(
+                output_dir,
+                f"channel_{channel_id}_pca_2d.png"
+            ),
+            dpi=300
+        )
+
         plt.close()
         
         # PLOT 3: 3D PCA
-        fig = plt.figure(figsize=(12, 10))
-        ax = fig.add_subplot(111, projection='3d')
+        fig = plt.figure(
+            figsize=(12, 10)
+        )
+
+        ax = fig.add_subplot(
+            111,
+            projection='3d'
+        )
+
         for label in unique_labels:
-            mask = (all_labels == label)
-            ax.scatter(principal_components[mask, 0], principal_components[mask, 1],
-                      principal_components[mask, 2],
-                      color=color_map[label], s=15, alpha=0.6, label=f"Cluster {label}")
+
+            mask = (
+                pca_labels == label
+            )
+
+            ax.scatter(
+                principal_components[mask, 0],
+                principal_components[mask, 1],
+                principal_components[mask, 2],
+                color=color_map[label],
+                s=15,
+                alpha=0.6,
+                label=f"Cluster {label}"
+            )
+
         ax.set_xlabel("PC1")
         ax.set_ylabel("PC2")
         ax.set_zlabel("PC3")
-        ax.set_title(f"Channel {channel_id} — PCA 3D")
+
+        ax.set_title(
+            f"Channel {channel_id} — PCA 3D"
+        )
+
         ax.legend(loc='best')
-        plt.savefig(os.path.join(output_dir, f"channel_{channel_id}_pca_3d.png"), dpi=300)
+
+        plt.savefig(
+            os.path.join(
+                output_dir,
+                f"channel_{channel_id}_pca_3d.png"
+            ),
+            dpi=300
+        )
+
         plt.close()
         
         # Save spike times
@@ -596,6 +733,7 @@ def cluster_channel_with_tridesclous(channel_id, raw_data, sampling_rate, output
         
         return {
             'channel_id': channel_id,
+            'status': "SUCCESS",
             'n_clusters': n_clusters,
             'cluster_templates': cluster_templates,
             'cluster_metrics': cluster_metrics,
@@ -606,13 +744,95 @@ def cluster_channel_with_tridesclous(channel_id, raw_data, sampling_rate, output
         print(f"Error processing channel {channel_id}: {e}")
         import traceback
         traceback.print_exc()
-        return None
+        return {
+            "channel_id": channel_id,
+            "status": "ERROR",
+            "n_clusters": 0,
+            "cluster_metrics": [],
+            "channel_metrics": None
+        }
     
     finally:
+
         try:
-            shutil.rmtree(temp_folder)
+            peeler = None
         except:
             pass
+
+        try:
+            catalogue = None
+        except:
+            pass
+
+        try:
+            cc = None
+        except:
+            pass
+
+        try:
+            dataio = None
+        except:
+            pass
+
+        try:
+            spikes = None
+        except:
+            pass
+
+        try:
+            channel_data = None
+        except:
+            pass
+
+        try:
+            all_waveforms = None
+        except:
+            pass
+
+        try:
+            all_labels = None
+        except:
+            pass
+
+        try:
+            pca_waveforms = None
+        except:
+            pass
+
+        try:
+            pca_labels = None
+        except:
+            pass
+
+        try:
+            principal_components = None
+        except:
+            pass
+
+        try:
+            cluster_data = None
+        except:
+            pass
+
+        try:
+            cluster_templates = None
+        except:
+            pass
+
+        gc.collect()
+
+        try:
+            shutil.rmtree(
+                temp_folder
+            )
+
+        except Exception as cleanup_error:
+
+            print(
+                f"Warning: could not remove "
+                f"temporary channel folder: "
+                f"{cleanup_error}"
+            )
 
 def get_excluded_channels(n_channels):
     print(f"\n{'='*60}\nCHANNEL EXCLUSION\n{'='*60}")
@@ -625,7 +845,8 @@ def get_excluded_channels(n_channels):
     try:
         excluded = [int(ch.strip()) for ch in input("Excluded channels: ").strip().split(',')]
         return [ch for ch in excluded if 0 <= ch < n_channels]
-    except:
+    except Exception:
+        print("Invalid input. No channels excluded.")
         return []
 
 def generate_car_groups(
@@ -940,40 +1161,102 @@ def save_car_comparison_plots(raw_snippet, snippet_offset, car_data, sampling_ra
         print(f"  Saved: {fname}")
 
 
-def process_all_channels(raw_snippet, snippet_offset, car_data, sampling_rate, excluded_channels,
-                          output_dir='clustering_results'):
-    if not os.path.exists(output_dir): os.makedirs(output_dir)
+def process_all_channels(
+    raw_snippet,
+    snippet_offset,
+    car_data,
+    sampling_rate,
+    excluded_channels,
+    output_dir='clustering_results'
+):
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
 
     # Save pre/post-CAR comparison plots before clustering
-    save_car_comparison_plots(raw_snippet, snippet_offset, car_data, sampling_rate, excluded_channels, output_dir)
+    save_car_comparison_plots(
+        raw_snippet,
+        snippet_offset,
+        car_data,
+        sampling_rate,
+        excluded_channels,
+        output_dir
+    )
 
     n_channels = car_data.shape[1]
-    included_channels = [ch for ch in range(n_channels) if ch not in excluded_channels]
-    
-    print(f"\n{'='*60}\nPROCESSING {len(included_channels)} CHANNELS\n{'='*60}")
-    
+
+    included_channels = [
+        ch
+        for ch in range(n_channels)
+        if ch not in excluded_channels
+    ]
+
+    print(
+        f"\n{'='*60}\n"
+        f"PROCESSING {len(included_channels)} CHANNELS\n"
+        f"{'='*60}"
+    )
+
+    # Store summary information only.
+    # Do not retain waveform/template arrays for every channel.
     all_results = {}
+
     for channel_id in included_channels:
-        result = cluster_channel_with_tridesclous(channel_id, car_data, sampling_rate, output_dir)
-        if result: all_results[channel_id] = result
-    
+
+        result = cluster_channel_with_tridesclous(
+            channel_id,
+            car_data,
+            sampling_rate,
+            output_dir
+        )
+
+        if result is not None:
+            all_results[channel_id] = {
+                'channel_id': result['channel_id'],
+                'status': result['status'],
+                'n_clusters': result['n_clusters'],
+                'cluster_metrics': result['cluster_metrics'],
+                'channel_metrics': result['channel_metrics']
+            }
+
+        # Explicitly release the complete channel result.
+        del result
+
+        gc.collect()
+
+        print(
+            f"Memory cleanup complete after "
+            f"channel {channel_id}"
+        )
+
     summary = {
         'n_channels_processed': len(all_results),
         'sampling_rate': float(sampling_rate),
         'timestamp': datetime.now().isoformat(),
         'channels': {}
     }
-    
+
     for ch, res in all_results.items():
+
         summary['channels'][str(ch)] = {
+            'status': res['status'],
             'n_clusters': res['n_clusters'],
             'cluster_metrics': res['cluster_metrics'],
             'channel_metrics': res['channel_metrics']
         }
-    
-    with open(os.path.join(output_dir, 'processing_summary.json'), 'w') as f:
-        json.dump(summary, f, indent=2)
-    
+
+    with open(
+        os.path.join(
+            output_dir,
+            'processing_summary.json'
+        ),
+        'w'
+    ) as f:
+        json.dump(
+            summary,
+            f,
+            indent=2
+        )
+
     return all_results
 
 def has_csc_files(folder_path):
